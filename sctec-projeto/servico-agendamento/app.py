@@ -5,6 +5,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+import requests
+
 from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 
@@ -15,6 +17,12 @@ LOG_PATH = os.path.join(BASE_DIR, "app.log")
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Modo de execução:
+# - Entrega 2: USE_COORDINATOR=false  -> demonstra a condição de corrida.
+# - Entrega 3: USE_COORDINATOR=true   -> usa o serviço coordenador Node.js para lock/unlock.
+USE_COORDINATOR = os.getenv("USE_COORDINATOR", "false").lower() == "true"
+COORDINATOR_URL = os.getenv("COORDINATOR_URL", "http://127.0.0.1:3000")
 
 # Atraso proposital para evidenciar a condição de corrida na Entrega 2.
 # Várias requisições conseguem verificar "sem conflito" antes da primeira gravar.
@@ -97,7 +105,7 @@ logger = logging.getLogger("servico-agendamento")
 
 def log_auditoria(event_type, request_id, actor, details):
     """
-    Log de auditoria da Entrega 2.
+    Log de auditoria das Entregas 2 e 3.
 
     O enunciado permite usar WARNING ou um nível customizado AUDIT.
     Aqui usamos WARNING para aparecer claramente no app.log, mas o JSON
@@ -169,6 +177,58 @@ def existe_conflito(telescopio_id, inicio, fim):
     ).first() is not None
 
 
+def recurso_lock(telescopio, inicio):
+    """
+    Nome do recurso crítico protegido pelo coordenador na Entrega 3.
+    O mesmo telescópio no mesmo horário gera a mesma chave de lock.
+    """
+    return f"{telescopio.codigo}_{inicio}"
+
+
+def adquirir_lock(recurso, request_id):
+    """
+    Entrega 3: chamada ao serviço coordenador Node.js.
+    Esperado:
+    - 200: lock concedido; pode seguir para a seção crítica.
+    - 409: recurso ocupado; rejeitar agendamento no Flask.
+    """
+    logger.info("Tentando adquirir lock para o recurso %s", recurso)
+
+    try:
+        resposta = requests.post(
+            f"{COORDINATOR_URL}/lock",
+            json={"resource": recurso, "request_id": request_id},
+            timeout=3,
+        )
+    except requests.RequestException as exc:
+        logger.error("Erro ao comunicar com coordenador: %s", exc)
+        return False, "COORDENADOR_INDISPONIVEL"
+
+    if resposta.status_code == 200:
+        logger.info("Lock adquirido com sucesso para o recurso %s", recurso)
+        return True, None
+
+    logger.info("Falha ao adquirir lock para o recurso %s, recurso ocupado", recurso)
+    return False, "RECURSO_OCUPADO"
+
+
+def liberar_lock(recurso, request_id):
+    """
+    Entrega 3: liberação do recurso no coordenador.
+    Esta função deve ser chamada em finally para evitar lock preso.
+    """
+    logger.info("Liberando lock para o recurso %s", recurso)
+
+    try:
+        requests.post(
+            f"{COORDINATOR_URL}/unlock",
+            json={"resource": recurso, "request_id": request_id},
+            timeout=3,
+        )
+    except requests.RequestException as exc:
+        logger.error("Erro ao liberar lock no coordenador: %s", exc)
+
+
 def agendamento_to_dict(agendamento):
     return {
         "agendamento_id": agendamento.agendamento_id,
@@ -209,7 +269,7 @@ with app.app_context():
 @app.route("/")
 def home():
     return jsonify({
-        "mensagem": "SCTEC - Serviço de Agendamento - Entrega 2",
+        "mensagem": "SCTEC - Serviço de Agendamento - Entregas 2 e 3",
         "_links": {
             "agendamentos": {
                 "href": "/agendamentos",
@@ -356,53 +416,74 @@ def agendamentos():
     inicio = data["horario_inicio_utc"]
     fim = data.get("horario_fim_utc", "2025-12-01T03:05:00Z")
     timestamp_requisicao = data.get("timestamp_requisicao_utc", utc_now_iso())
+    recurso = recurso_lock(telescopio, inicio)
+    lock_obtido = False
 
-    logger.info("Iniciando verificação de conflito no BD")
-    conflito = existe_conflito(telescopio.telescopio_id, inicio, fim)
+    try:
+        # Entrega 3: antes de tocar no banco, o Flask pede permissão ao coordenador.
+        # Entrega 2: USE_COORDINATOR=false, então este bloco é ignorado e a falha aparece.
+        if USE_COORDINATOR:
+            lock_obtido, motivo_lock = adquirir_lock(recurso, request_id)
+            if not lock_obtido:
+                return erro(
+                    "RECURSO_OCUPADO",
+                    f"O recurso {recurso} já está ocupado ou em processamento. Motivo: {motivo_lock}.",
+                    409,
+                    request_id,
+                )
 
-    # Atraso intencional para demonstrar a condição de corrida.
-    # Sem lock/coordenador, várias requisições concorrentes passam por aqui.
-    time.sleep(RACE_DELAY_SECONDS)
+        logger.info("Iniciando verificação de conflito no BD")
+        conflito = existe_conflito(telescopio.telescopio_id, inicio, fim)
 
-    if conflito:
-        logger.info("Conflito encontrado no BD")
-        return erro("CONFLITO_DE_HORARIO", "Já existe agendamento confirmado para este intervalo.", 409, request_id)
+        # Atraso intencional para demonstrar a condição de corrida.
+        # Na Entrega 2, sem lock, várias requisições concorrentes passam por aqui.
+        # Na Entrega 3, só uma requisição chega aqui por vez para o mesmo recurso.
+        time.sleep(RACE_DELAY_SECONDS)
 
-    logger.info("Salvando novo agendamento no BD")
+        if conflito:
+            logger.info("Conflito encontrado no BD")
+            return erro("CONFLITO_DE_HORARIO", "Já existe agendamento confirmado para este intervalo.", 409, request_id)
 
-    agendamento = Agendamento(
-        cientista_id=cientista.cientista_id,
-        telescopio_id=telescopio.telescopio_id,
-        horario_inicio_utc=inicio,
-        horario_fim_utc=fim,
-        timestamp_requisicao_utc=timestamp_requisicao,
-        status="CONFIRMADO",
-        objetivo_observacao=data.get("objetivo_observacao", "Observação acadêmica do telescópio espacial."),
-        criado_em_utc=utc_now_iso(),
-    )
+        logger.info("Salvando novo agendamento no BD")
 
-    db.session.add(agendamento)
-    db.session.commit()
+        agendamento = Agendamento(
+            cientista_id=cientista.cientista_id,
+            telescopio_id=telescopio.telescopio_id,
+            horario_inicio_utc=inicio,
+            horario_fim_utc=fim,
+            timestamp_requisicao_utc=timestamp_requisicao,
+            status="CONFIRMADO",
+            objetivo_observacao=data.get("objetivo_observacao", "Observação acadêmica do telescópio espacial."),
+            criado_em_utc=utc_now_iso(),
+        )
 
-    log_auditoria(
-        "AGENDAMENTO_CRIADO",
-        request_id,
-        actor={
-            "type": "CIENTISTA",
-            "cientista_id": cientista.cientista_id,
-            "nome": cientista.nome,
-        },
-        details={
-            "agendamento_id": agendamento.agendamento_id,
-            "cientista_id": cientista.cientista_id,
-            "telescopio_id": telescopio.telescopio_id,
-            "horario_inicio_utc": agendamento.horario_inicio_utc,
-            "horario_fim_utc": agendamento.horario_fim_utc,
-            "status": agendamento.status,
-        },
-    )
+        db.session.add(agendamento)
+        db.session.commit()
 
-    return jsonify(agendamento_to_dict(agendamento)), 201
+        log_auditoria(
+            "AGENDAMENTO_CRIADO",
+            request_id,
+            actor={
+                "type": "CIENTISTA",
+                "cientista_id": cientista.cientista_id,
+                "nome": cientista.nome,
+            },
+            details={
+                "agendamento_id": agendamento.agendamento_id,
+                "cientista_id": cientista.cientista_id,
+                "telescopio_id": telescopio.telescopio_id,
+                "recurso_lock": recurso,
+                "horario_inicio_utc": agendamento.horario_inicio_utc,
+                "horario_fim_utc": agendamento.horario_fim_utc,
+                "status": agendamento.status,
+            },
+        )
+
+        return jsonify(agendamento_to_dict(agendamento)), 201
+    finally:
+        # Entrega 3: garante unlock mesmo se ocorrer erro depois do lock.
+        if USE_COORDINATOR and lock_obtido:
+            liberar_lock(recurso, request_id)
 
 
 @app.route("/agendamentos/<int:agendamento_id>")
