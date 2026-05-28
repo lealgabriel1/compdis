@@ -6,34 +6,25 @@ import uuid
 from datetime import datetime, timezone
 
 import requests
-
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "sctec.db")
 LOG_PATH = os.path.join(BASE_DIR, "app.log")
 
-app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
+app = Flask(__name__, static_folder="static")
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH}")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# Modo de execução:
-# - Entrega 2: USE_COORDINATOR=false  -> demonstra a condição de corrida.
-# - Entrega 3: USE_COORDINATOR=true   -> usa o serviço coordenador Node.js para lock/unlock.
+# Para a Entrega 2: false => demonstra a condição de corrida.
+# Para a Entrega 3/5: true => protege a seção crítica via serviço coordenador.
 USE_COORDINATOR = os.getenv("USE_COORDINATOR", "false").lower() == "true"
 COORDINATOR_URL = os.getenv("COORDINATOR_URL", "http://127.0.0.1:3000")
-
-# Atraso proposital para evidenciar a condição de corrida na Entrega 2.
-# Várias requisições conseguem verificar "sem conflito" antes da primeira gravar.
 RACE_DELAY_SECONDS = float(os.getenv("RACE_DELAY_SECONDS", "0.35"))
 
 db = SQLAlchemy(app)
 
-
-# ============================================================
-# Models
-# ============================================================
 
 class Cientista(db.Model):
     __tablename__ = "cientistas"
@@ -42,6 +33,9 @@ class Cientista(db.Model):
     nome = db.Column(db.String(160), nullable=False)
     email = db.Column(db.String(160), nullable=False, unique=True)
     instituicao = db.Column(db.String(160), nullable=False)
+    pais = db.Column(db.String(80))
+    area_pesquisa = db.Column(db.String(120))
+    criado_em_utc = db.Column(db.String(40), nullable=False)
     ativo = db.Column(db.Boolean, nullable=False, default=True)
 
 
@@ -51,7 +45,9 @@ class Telescopio(db.Model):
     telescopio_id = db.Column(db.Integer, primary_key=True)
     codigo = db.Column(db.String(80), nullable=False, unique=True)
     nome = db.Column(db.String(160), nullable=False)
+    descricao = db.Column(db.Text)
     status_operacional = db.Column(db.String(40), nullable=False, default="OPERACIONAL")
+    criado_em_utc = db.Column(db.String(40), nullable=False)
 
 
 class Agendamento(db.Model):
@@ -66,109 +62,164 @@ class Agendamento(db.Model):
     status = db.Column(db.String(40), nullable=False, default="CONFIRMADO")
     objetivo_observacao = db.Column(db.Text)
     criado_em_utc = db.Column(db.String(40), nullable=False)
+    cancelado_em_utc = db.Column(db.String(40))
+    motivo_cancelamento = db.Column(db.Text)
 
-
-# ============================================================
-# Utils
-# ============================================================
 
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def gerar_request_id():
+def request_id():
     return f"req-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
 
-def configurar_logs():
-    logger_root = logging.getLogger()
-    logger_root.setLevel(logging.INFO)
-    logger_root.handlers.clear()
+def configure_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
 
-    formato = logging.Formatter(
-        "%(levelname)s:%(asctime)sZ:%(name)s:%(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
+    formatter = logging.Formatter("%(levelname)s:%(asctime)sZ:%(name)s:%(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
 
-    arquivo = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    arquivo.setFormatter(formato)
-    logger_root.addHandler(arquivo)
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
-    console = logging.StreamHandler()
-    console.setFormatter(formato)
-    logger_root.addHandler(console)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 
-configurar_logs()
+configure_logging()
 logger = logging.getLogger("servico-agendamento")
 
 
-def log_auditoria(event_type, request_id, actor, details):
-    """
-    Log de auditoria das Entregas 2 e 3.
-
-    O enunciado permite usar WARNING ou um nível customizado AUDIT.
-    Aqui usamos WARNING para aparecer claramente no app.log, mas o JSON
-    interno carrega "level": "AUDIT".
-    """
-    evento = {
+def audit(event_type, req_id, actor, details):
+    event = {
         "timestamp_utc": utc_now_iso(),
         "level": "AUDIT",
         "event_type": event_type,
         "service": "servico-agendamento",
-        "request_id": request_id,
+        "request_id": req_id,
         "actor": actor,
         "details": details,
     }
-
-    logger.warning(json.dumps(evento, ensure_ascii=False, sort_keys=True))
-
-
-def erro(codigo, mensagem, http_status, request_id=None):
-    return jsonify({
-        "erro": {
-            "codigo": codigo,
-            "mensagem": mensagem,
-            "request_id": request_id or gerar_request_id(),
-        },
-        "_links": {
-            "agendamentos": {
-                "href": "/agendamentos",
-                "method": "GET",
-            }
-        },
-    }), http_status
+    logger.warning(json.dumps(event, ensure_ascii=False, sort_keys=True))
 
 
-def popular_dados_iniciais():
+def seed_data():
     if not Cientista.query.get(1):
         db.session.add(Cientista(
             cientista_id=1,
             nome="Marie Curie",
             email="marie.curie@universidade-paris.fr",
             instituicao="Universidade de Paris",
+            pais="França",
+            area_pesquisa="Radiação cósmica",
+            criado_em_utc=utc_now_iso(),
             ativo=True,
         ))
-
+    if not Cientista.query.get(2):
+        db.session.add(Cientista(
+            cientista_id=2,
+            nome="Cecilia Payne-Gaposchkin",
+            email="cecilia.payne@harvard.edu",
+            instituicao="Harvard College Observatory",
+            pais="Estados Unidos",
+            area_pesquisa="Astrofísica estelar",
+            criado_em_utc=utc_now_iso(),
+            ativo=True,
+        ))
     if not Telescopio.query.get(1):
         db.session.add(Telescopio(
             telescopio_id=1,
             codigo="Hubble-Acad",
             nome="Telescópio Espacial Acadêmico Hubble-Acad",
+            descricao="Telescópio espacial compartilhado por instituições acadêmicas.",
             status_operacional="OPERACIONAL",
+            criado_em_utc=utc_now_iso(),
         ))
-
     db.session.commit()
 
 
-def existe_conflito(telescopio_id, inicio, fim):
-    """
-    Verificação simples de conflito de horário.
+with app.app_context():
+    db.create_all()
+    seed_data()
 
-    Na Entrega 2 ela é propositalmente insuficiente sob concorrência:
-    várias threads verificam antes de qualquer uma gravar, então todas
-    acreditam que o horário está livre.
-    """
+
+def cientista_to_dict(cientista):
+    return {
+        "cientista_id": cientista.cientista_id,
+        "nome": cientista.nome,
+        "email": cientista.email,
+        "instituicao": cientista.instituicao,
+        "pais": cientista.pais,
+        "area_pesquisa": cientista.area_pesquisa,
+        "criado_em_utc": cientista.criado_em_utc,
+        "ativo": cientista.ativo,
+        "_links": {
+            "self": {"href": f"/cientistas/{cientista.cientista_id}", "method": "GET"},
+            "agendamentos": {"href": f"/cientistas/{cientista.cientista_id}/agendamentos", "method": "GET"},
+            "criar_agendamento": {"href": "/agendamentos", "method": "POST"},
+        },
+    }
+
+
+def telescopio_to_dict(telescopio):
+    return {
+        "telescopio_id": telescopio.telescopio_id,
+        "codigo": telescopio.codigo,
+        "nome": telescopio.nome,
+        "descricao": telescopio.descricao,
+        "status_operacional": telescopio.status_operacional,
+        "criado_em_utc": telescopio.criado_em_utc,
+        "_links": {
+            "self": {"href": f"/telescopios/{telescopio.telescopio_id}", "method": "GET"},
+            "agendamentos": {"href": f"/telescopios/{telescopio.telescopio_id}/agendamentos", "method": "GET"},
+        },
+    }
+
+
+def agendamento_to_dict(agendamento, include_all=True):
+    data = {
+        "agendamento_id": agendamento.agendamento_id,
+        "cientista_id": agendamento.cientista_id,
+        "telescopio_id": agendamento.telescopio_id,
+        "horario_inicio_utc": agendamento.horario_inicio_utc,
+        "horario_fim_utc": agendamento.horario_fim_utc,
+        "status": agendamento.status,
+        "_links": {
+            "self": {"href": f"/agendamentos/{agendamento.agendamento_id}", "method": "GET"},
+            "cientista": {"href": f"/cientistas/{agendamento.cientista_id}", "method": "GET"},
+            "telescopio": {"href": f"/telescopios/{agendamento.telescopio_id}", "method": "GET"},
+        },
+    }
+    if agendamento.status == "CONFIRMADO":
+        data["_links"]["cancelar"] = {"href": f"/agendamentos/{agendamento.agendamento_id}/cancelar", "method": "POST"}
+    if include_all:
+        data.update({
+            "timestamp_requisicao_utc": agendamento.timestamp_requisicao_utc,
+            "objetivo_observacao": agendamento.objetivo_observacao,
+            "criado_em_utc": agendamento.criado_em_utc,
+            "cancelado_em_utc": agendamento.cancelado_em_utc,
+            "motivo_cancelamento": agendamento.motivo_cancelamento,
+        })
+    return data
+
+
+def erro(codigo, mensagem, status_code, req_id=None, extra_links=None):
+    payload = {
+        "erro": {
+            "codigo": codigo,
+            "mensagem": mensagem,
+            "request_id": req_id or request_id(),
+        },
+        "_links": extra_links or {"self": {"href": request.path, "method": request.method}},
+    }
+    return jsonify(payload), status_code
+
+
+def has_conflict(telescopio_id, inicio, fim):
     return Agendamento.query.filter(
         Agendamento.telescopio_id == telescopio_id,
         Agendamento.status == "CONFIRMADO",
@@ -178,190 +229,120 @@ def existe_conflito(telescopio_id, inicio, fim):
 
 
 def recurso_lock(telescopio, inicio):
-    """
-    Nome do recurso crítico protegido pelo coordenador na Entrega 3.
-    O mesmo telescópio no mesmo horário gera a mesma chave de lock.
-    """
     return f"{telescopio.codigo}_{inicio}"
 
 
-def adquirir_lock(recurso, request_id):
-    """
-    Entrega 3: chamada ao serviço coordenador Node.js.
-    Esperado:
-    - 200: lock concedido; pode seguir para a seção crítica.
-    - 409: recurso ocupado; rejeitar agendamento no Flask.
-    """
+def acquire_lock(recurso, req_id):
     logger.info("Tentando adquirir lock para o recurso %s", recurso)
-
     try:
-        resposta = requests.post(
-            f"{COORDINATOR_URL}/lock",
-            json={"resource": recurso, "request_id": request_id},
-            timeout=3,
-        )
+        response = requests.post(f"{COORDINATOR_URL}/lock", json={"resource": recurso, "request_id": req_id}, timeout=3)
     except requests.RequestException as exc:
         logger.error("Erro ao comunicar com coordenador: %s", exc)
         return False, "COORDENADOR_INDISPONIVEL"
 
-    if resposta.status_code == 200:
+    if response.status_code == 200:
         logger.info("Lock adquirido com sucesso para o recurso %s", recurso)
         return True, None
-
     logger.info("Falha ao adquirir lock para o recurso %s, recurso ocupado", recurso)
     return False, "RECURSO_OCUPADO"
 
 
-def liberar_lock(recurso, request_id):
-    """
-    Entrega 3: liberação do recurso no coordenador.
-    Esta função deve ser chamada em finally para evitar lock preso.
-    """
+def release_lock(recurso, req_id):
     logger.info("Liberando lock para o recurso %s", recurso)
-
     try:
-        requests.post(
-            f"{COORDINATOR_URL}/unlock",
-            json={"resource": recurso, "request_id": request_id},
-            timeout=3,
-        )
+        requests.post(f"{COORDINATOR_URL}/unlock", json={"resource": recurso, "request_id": req_id}, timeout=3)
     except requests.RequestException as exc:
         logger.error("Erro ao liberar lock no coordenador: %s", exc)
 
 
-def agendamento_to_dict(agendamento):
-    return {
-        "agendamento_id": agendamento.agendamento_id,
-        "cientista_id": agendamento.cientista_id,
-        "telescopio_id": agendamento.telescopio_id,
-        "horario_inicio_utc": agendamento.horario_inicio_utc,
-        "horario_fim_utc": agendamento.horario_fim_utc,
-        "timestamp_requisicao_utc": agendamento.timestamp_requisicao_utc,
-        "status": agendamento.status,
-        "objetivo_observacao": agendamento.objetivo_observacao,
-        "criado_em_utc": agendamento.criado_em_utc,
-        "_links": {
-            "self": {
-                "href": f"/agendamentos/{agendamento.agendamento_id}",
-                "method": "GET",
-            },
-            "cientista": {
-                "href": f"/cientistas/{agendamento.cientista_id}",
-                "method": "GET",
-            },
-            "telescopio": {
-                "href": f"/telescopios/{agendamento.telescopio_id}",
-                "method": "GET",
-            },
-        },
-    }
-
-
-with app.app_context():
-    db.create_all()
-    popular_dados_iniciais()
-
-
-# ============================================================
-# Rotas auxiliares para demonstração
-# ============================================================
-
 @app.route("/")
-def home():
+def index():
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/time")
+def server_time():
+    logger.info("Requisição recebida em GET /time")
+    now = datetime.now(timezone.utc)
     return jsonify({
-        "mensagem": "SCTEC - Serviço de Agendamento - Entregas 2 e 3",
+        "server_time_utc": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "epoch_ms": int(now.timestamp() * 1000),
         "_links": {
-            "agendamentos": {
-                "href": "/agendamentos",
-                "method": "GET",
-            },
-            "criar_agendamento": {
-                "href": "/agendamentos",
-                "method": "POST",
-            },
-            "reset_teste": {
-                "href": "/debug/reset",
-                "method": "POST",
-            },
+            "self": {"href": "/time", "method": "GET"},
+            "criar_agendamento": {"href": "/agendamentos", "method": "POST"},
         },
     })
 
 
-@app.route("/debug/reset", methods=["POST"])
-def reset_debug():
-    """
-    Rota auxiliar para regravar o vídeo/teste da Entrega 2.
+@app.route("/cientistas", methods=["GET", "POST"])
+def cientistas():
+    if request.method == "GET":
+        return jsonify({
+            "items": [cientista_to_dict(c) for c in Cientista.query.order_by(Cientista.cientista_id).all()],
+            "_links": {"self": {"href": "/cientistas", "method": "GET"}, "criar": {"href": "/cientistas", "method": "POST"}},
+        })
 
-    Ela limpa os agendamentos e o app.log, permitindo executar o teste
-    de estresse novamente a partir de uma base limpa.
-    """
-    Agendamento.query.delete()
+    data = request.get_json(silent=True) or {}
+    for field in ["nome", "email", "instituicao"]:
+        if not data.get(field):
+            return erro("DADOS_INVALIDOS", f"Campo obrigatório ausente: {field}", 400)
+    cientista = Cientista(
+        nome=data["nome"],
+        email=data["email"],
+        instituicao=data["instituicao"],
+        pais=data.get("pais"),
+        area_pesquisa=data.get("area_pesquisa"),
+        criado_em_utc=utc_now_iso(),
+        ativo=data.get("ativo", True),
+    )
+    db.session.add(cientista)
     db.session.commit()
+    return jsonify(cientista_to_dict(cientista)), 201
 
-    open(LOG_PATH, "w", encoding="utf-8").close()
-    logger.info("Base de agendamentos e app.log reiniciados para teste")
-
-    return jsonify({
-        "status": "resetado",
-        "_links": {
-            "agendamentos": {
-                "href": "/agendamentos",
-                "method": "GET",
-            }
-        },
-    })
-
-
-# ============================================================
-# Rotas principais
-# ============================================================
 
 @app.route("/cientistas/<int:cientista_id>")
-def obter_cientista(cientista_id):
+def get_cientista(cientista_id):
     cientista = Cientista.query.get_or_404(cientista_id)
+    return jsonify(cientista_to_dict(cientista))
 
+
+@app.route("/cientistas/<int:cientista_id>/agendamentos")
+def get_agendamentos_cientista(cientista_id):
+    Cientista.query.get_or_404(cientista_id)
+    itens = Agendamento.query.filter_by(cientista_id=cientista_id).order_by(Agendamento.agendamento_id).all()
     return jsonify({
-        "cientista_id": cientista.cientista_id,
-        "nome": cientista.nome,
-        "email": cientista.email,
-        "instituicao": cientista.instituicao,
-        "ativo": cientista.ativo,
+        "items": [agendamento_to_dict(a, include_all=False) for a in itens],
         "_links": {
-            "self": {
-                "href": f"/cientistas/{cientista.cientista_id}",
-                "method": "GET",
-            },
-            "agendamentos": {
-                "href": f"/agendamentos?cientista_id={cientista.cientista_id}",
-                "method": "GET",
-            },
-            "criar_agendamento": {
-                "href": "/agendamentos",
-                "method": "POST",
-            },
+            "cientista": {"href": f"/cientistas/{cientista_id}", "method": "GET"},
+            "criar_agendamento": {"href": "/agendamentos", "method": "POST"},
         },
+    })
+
+
+@app.route("/telescopios")
+def telescopios():
+    return jsonify({
+        "items": [telescopio_to_dict(t) for t in Telescopio.query.order_by(Telescopio.telescopio_id).all()],
+        "_links": {"self": {"href": "/telescopios", "method": "GET"}},
     })
 
 
 @app.route("/telescopios/<int:telescopio_id>")
-def obter_telescopio(telescopio_id):
+def get_telescopio(telescopio_id):
     telescopio = Telescopio.query.get_or_404(telescopio_id)
+    return jsonify(telescopio_to_dict(telescopio))
 
+
+@app.route("/telescopios/<int:telescopio_id>/agendamentos")
+def get_agendamentos_telescopio(telescopio_id):
+    Telescopio.query.get_or_404(telescopio_id)
+    query = Agendamento.query.filter_by(telescopio_id=telescopio_id)
+    if request.args.get("status"):
+        query = query.filter_by(status=request.args["status"])
+    itens = query.order_by(Agendamento.agendamento_id).all()
     return jsonify({
-        "telescopio_id": telescopio.telescopio_id,
-        "codigo": telescopio.codigo,
-        "nome": telescopio.nome,
-        "status_operacional": telescopio.status_operacional,
-        "_links": {
-            "self": {
-                "href": f"/telescopios/{telescopio.telescopio_id}",
-                "method": "GET",
-            },
-            "agendamentos": {
-                "href": f"/agendamentos?telescopio_id={telescopio.telescopio_id}",
-                "method": "GET",
-            },
-        },
+        "items": [agendamento_to_dict(a, include_all=False) for a in itens],
+        "_links": {"telescopio": {"href": f"/telescopios/{telescopio_id}", "method": "GET"}},
     })
 
 
@@ -369,83 +350,77 @@ def obter_telescopio(telescopio_id):
 def agendamentos():
     if request.method == "GET":
         query = Agendamento.query
-
-        cientista_id = request.args.get("cientista_id")
-        telescopio_id = request.args.get("telescopio_id")
-
-        if cientista_id:
-            query = query.filter(Agendamento.cientista_id == int(cientista_id))
-        if telescopio_id:
-            query = query.filter(Agendamento.telescopio_id == int(telescopio_id))
-
+        for field in ["cientista_id", "telescopio_id", "status"]:
+            value = request.args.get(field)
+            if value:
+                query = query.filter(getattr(Agendamento, field) == value)
         itens = query.order_by(Agendamento.agendamento_id).all()
-
         return jsonify({
-            "items": [agendamento_to_dict(item) for item in itens],
-            "_links": {
-                "self": {
-                    "href": "/agendamentos",
-                    "method": "GET",
-                },
-                "criar": {
-                    "href": "/agendamentos",
-                    "method": "POST",
-                },
-            },
+            "items": [agendamento_to_dict(a, include_all=False) for a in itens],
+            "_links": {"self": {"href": "/agendamentos", "method": "GET"}, "criar": {"href": "/agendamentos", "method": "POST"}},
         })
 
-    request_id = request.headers.get("X-Request-ID", gerar_request_id())
     data = request.get_json(silent=True) or {}
-
+    req_id = request.headers.get("X-Request-ID", request_id())
     logger.info("Requisição recebida para POST /agendamentos")
 
-    campos_obrigatorios = ["cientista_id", "horario_inicio_utc"]
-    for campo in campos_obrigatorios:
-        if not data.get(campo):
-            return erro("DADOS_INVALIDOS", f"Campo obrigatório ausente: {campo}", 400, request_id)
+    required = ["cientista_id", "horario_inicio_utc"]
+    for field in required:
+        if not data.get(field):
+            return erro("DADOS_INVALIDOS", f"Campo obrigatório ausente: {field}", 400, req_id)
 
     cientista = Cientista.query.get(data["cientista_id"])
     if not cientista or not cientista.ativo:
-        return erro("CIENTISTA_INVALIDO", "Cientista inexistente ou inativo.", 400, request_id)
+        return erro("CIENTISTA_INVALIDO", "Cientista inexistente ou inativo.", 400, req_id)
 
     telescopio_id = int(data.get("telescopio_id", 1))
     telescopio = Telescopio.query.get(telescopio_id)
     if not telescopio or telescopio.status_operacional != "OPERACIONAL":
-        return erro("TELESCOPIO_INDISPONIVEL", "Telescópio inexistente ou indisponível.", 400, request_id)
+        return erro("TELESCOPIO_INDISPONIVEL", "Telescópio inexistente ou indisponível.", 400, req_id)
 
     inicio = data["horario_inicio_utc"]
-    fim = data.get("horario_fim_utc", "2025-12-01T03:05:00Z")
-    timestamp_requisicao = data.get("timestamp_requisicao_utc", utc_now_iso())
+    fim = data.get("horario_fim_utc") or inicio.replace("03:00:00Z", "03:05:00Z")
+    timestamp_requisicao = data.get("timestamp_requisicao_utc") or utc_now_iso()
     recurso = recurso_lock(telescopio, inicio)
     lock_obtido = False
 
+    actor = {"type": "CIENTISTA", "cientista_id": cientista.cientista_id, "nome": cientista.nome}
+
     try:
-        # Entrega 3: antes de tocar no banco, o Flask pede permissão ao coordenador.
-        # Entrega 2: USE_COORDINATOR=false, então este bloco é ignorado e a falha aparece.
         if USE_COORDINATOR:
-            lock_obtido, motivo_lock = adquirir_lock(recurso, request_id)
+            lock_obtido, lock_error = acquire_lock(recurso, req_id)
             if not lock_obtido:
-                return erro(
-                    "RECURSO_OCUPADO",
-                    f"O recurso {recurso} já está ocupado ou em processamento. Motivo: {motivo_lock}.",
-                    409,
-                    request_id,
-                )
+                audit("AGENDAMENTO_REJEITADO_CONFLITO", req_id, actor, {
+                    "cientista_id": cientista.cientista_id,
+                    "telescopio_id": telescopio.telescopio_id,
+                    "recurso_lock": recurso,
+                    "motivo": lock_error,
+                    "status": "REJEITADO",
+                })
+                return erro("RECURSO_OCUPADO", f"O recurso {recurso} já está ocupado ou em processamento.", 409, req_id, {
+                    "agendamentos": {"href": "/agendamentos", "method": "GET"},
+                    "telescopio": {"href": f"/telescopios/{telescopio.telescopio_id}", "method": "GET"},
+                })
 
         logger.info("Iniciando verificação de conflito no BD")
-        conflito = existe_conflito(telescopio.telescopio_id, inicio, fim)
+        conflito = has_conflict(telescopio.telescopio_id, inicio, fim)
 
-        # Atraso intencional para demonstrar a condição de corrida.
-        # Na Entrega 2, sem lock, várias requisições concorrentes passam por aqui.
-        # Na Entrega 3, só uma requisição chega aqui por vez para o mesmo recurso.
+        # Atraso proposital: na Entrega 2, sem coordenador, várias threads passam
+        # pela verificação antes que a primeira grave no banco, demonstrando a falha.
         time.sleep(RACE_DELAY_SECONDS)
 
         if conflito:
-            logger.info("Conflito encontrado no BD")
-            return erro("CONFLITO_DE_HORARIO", "Já existe agendamento confirmado para este intervalo.", 409, request_id)
+            audit("AGENDAMENTO_REJEITADO_CONFLITO", req_id, actor, {
+                "cientista_id": cientista.cientista_id,
+                "telescopio_id": telescopio.telescopio_id,
+                "recurso_lock": recurso,
+                "horario_inicio_utc": inicio,
+                "horario_fim_utc": fim,
+                "status": "REJEITADO",
+            })
+            return erro("CONFLITO_DE_HORARIO", "Já existe agendamento confirmado para este intervalo.", 409, req_id)
 
         logger.info("Salvando novo agendamento no BD")
-
         agendamento = Agendamento(
             cientista_id=cientista.cientista_id,
             telescopio_id=telescopio.telescopio_id,
@@ -456,42 +431,74 @@ def agendamentos():
             objetivo_observacao=data.get("objetivo_observacao", "Observação acadêmica do telescópio espacial."),
             criado_em_utc=utc_now_iso(),
         )
-
         db.session.add(agendamento)
         db.session.commit()
 
-        log_auditoria(
-            "AGENDAMENTO_CRIADO",
-            request_id,
-            actor={
-                "type": "CIENTISTA",
-                "cientista_id": cientista.cientista_id,
-                "nome": cientista.nome,
-            },
-            details={
-                "agendamento_id": agendamento.agendamento_id,
-                "cientista_id": cientista.cientista_id,
-                "telescopio_id": telescopio.telescopio_id,
-                "recurso_lock": recurso,
-                "horario_inicio_utc": agendamento.horario_inicio_utc,
-                "horario_fim_utc": agendamento.horario_fim_utc,
-                "status": agendamento.status,
-            },
-        )
-
+        audit("AGENDAMENTO_CRIADO", req_id, actor, {
+            "agendamento_id": agendamento.agendamento_id,
+            "cientista_id": cientista.cientista_id,
+            "telescopio_id": telescopio.telescopio_id,
+            "recurso_lock": recurso,
+            "horario_inicio_utc": inicio,
+            "horario_fim_utc": fim,
+            "status": "CONFIRMADO",
+        })
         return jsonify(agendamento_to_dict(agendamento)), 201
     finally:
-        # Entrega 3: garante unlock mesmo se ocorrer erro depois do lock.
         if USE_COORDINATOR and lock_obtido:
-            liberar_lock(recurso, request_id)
+            release_lock(recurso, req_id)
 
 
 @app.route("/agendamentos/<int:agendamento_id>")
-def obter_agendamento(agendamento_id):
+def get_agendamento(agendamento_id):
     agendamento = Agendamento.query.get_or_404(agendamento_id)
     return jsonify(agendamento_to_dict(agendamento))
 
 
+@app.route("/agendamentos/<int:agendamento_id>/cancelar", methods=["POST"])
+def cancelar_agendamento(agendamento_id):
+    req_id = request.headers.get("X-Request-ID", request_id())
+    logger.info("Requisição recebida para POST /agendamentos/%s/cancelar", agendamento_id)
+    agendamento = Agendamento.query.get_or_404(agendamento_id)
+    data = request.get_json(silent=True) or {}
+
+    if agendamento.status == "CANCELADO":
+        return jsonify(agendamento_to_dict(agendamento)), 200
+
+    agendamento.status = "CANCELADO"
+    agendamento.cancelado_em_utc = utc_now_iso()
+    agendamento.motivo_cancelamento = data.get("motivo", "Cancelamento solicitado pelo cliente.")
+    db.session.commit()
+
+    cientista = Cientista.query.get(agendamento.cientista_id)
+    telescopio = Telescopio.query.get(agendamento.telescopio_id)
+    audit("AGENDAMENTO_CANCELADO", req_id, {
+        "type": "CIENTISTA",
+        "cientista_id": agendamento.cientista_id,
+        "nome": cientista.nome if cientista else None,
+    }, {
+        "agendamento_id": agendamento.agendamento_id,
+        "cientista_id": agendamento.cientista_id,
+        "telescopio_id": agendamento.telescopio_id,
+        "recurso_lock": recurso_lock(telescopio, agendamento.horario_inicio_utc) if telescopio else None,
+        "horario_inicio_utc": agendamento.horario_inicio_utc,
+        "horario_fim_utc": agendamento.horario_fim_utc,
+        "status": "CANCELADO",
+        "motivo_cancelamento": agendamento.motivo_cancelamento,
+    })
+    return jsonify(agendamento_to_dict(agendamento)), 200
+
+
+@app.route("/debug/reset", methods=["POST"])
+def reset_debug():
+    # Rota auxiliar para gravação do vídeo/testes. Não faz parte da API de produção.
+    Agendamento.query.delete()
+    db.session.commit()
+    open(LOG_PATH, "w", encoding="utf-8").close()
+    logger.info("Base de agendamentos e app.log reiniciados para teste")
+    return jsonify({"status": "resetado", "_links": {"agendamentos": {"href": "/agendamentos", "method": "GET"}}})
+
+
 if __name__ == "__main__":
-    porta = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=porta, threaded=True, debug=False)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, threaded=True, debug=False)

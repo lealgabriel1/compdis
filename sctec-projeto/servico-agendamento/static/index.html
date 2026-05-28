@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SCTEC - Cliente Inteligente</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 32px; background: #f6f7fb; color: #1d2433; }
+    main { max-width: 940px; margin: auto; }
+    section { background: white; border-radius: 14px; padding: 20px; margin-bottom: 16px; box-shadow: 0 8px 22px rgba(0,0,0,.06); }
+    label { display: block; margin-top: 10px; font-weight: 700; }
+    input, textarea, button { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 6px; border-radius: 8px; border: 1px solid #cfd5e1; }
+    button { cursor: pointer; background: #1f4ed8; color: white; border: 0; font-weight: 700; margin-top: 14px; }
+    button.secondary { background: #374151; }
+    button.danger { background: #b42318; }
+    pre { background: #111827; color: #d1fae5; padding: 14px; border-radius: 10px; overflow: auto; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>SCTEC - Cliente Inteligente</h1>
+  <p>Interface simples para validar a Entrega 4: sincronização de tempo via <code>/time</code> e cancelamento usando link HATEOAS.</p>
+
+  <section>
+    <h2>1. Sincronização de tempo</h2>
+    <button onclick="sincronizarTempo()">Sincronizar com o servidor</button>
+    <p><strong>Offset estimado:</strong> <span id="offset">não sincronizado</span></p>
+    <p><strong>Hora lógica atual:</strong> <span id="hora-logica">-</span></p>
+  </section>
+
+  <section>
+    <h2>2. Criar agendamento</h2>
+    <div class="grid">
+      <div>
+        <label>Cientista ID</label>
+        <input id="cientista_id" value="1" />
+      </div>
+      <div>
+        <label>Telescópio ID</label>
+        <input id="telescopio_id" value="1" />
+      </div>
+    </div>
+    <label>Início UTC</label>
+    <input id="inicio" value="2025-12-01T03:00:00Z" />
+    <label>Fim UTC</label>
+    <input id="fim" value="2025-12-01T03:05:00Z" />
+    <label>Objetivo</label>
+    <textarea id="objetivo">Observação acadêmica para demonstração do SCTEC.</textarea>
+    <button onclick="criarAgendamento()">Criar agendamento</button>
+  </section>
+
+  <section>
+    <h2>3. Ações HATEOAS</h2>
+    <p>Depois de criar um agendamento, o cliente lê o link <code>_links.cancelar</code> da resposta e usa esse link para cancelar.</p>
+    <button class="danger" onclick="cancelarViaHateoas()">Cancelar último agendamento via HATEOAS</button>
+    <button class="secondary" onclick="listarAgendamentos()">Listar agendamentos</button>
+  </section>
+
+  <section>
+    <h2>Resposta</h2>
+    <pre id="saida">Aguardando ação...</pre>
+  </section>
+</main>
+<script>
+let offsetMs = 0;
+let ultimoAgendamento = null;
+
+function horaLogicaISO() {
+  return new Date(Date.now() + offsetMs).toISOString().replace('.000Z', 'Z');
+}
+
+setInterval(() => {
+  document.getElementById('hora-logica').textContent = horaLogicaISO();
+}, 500);
+
+function mostrar(obj) {
+  document.getElementById('saida').textContent = JSON.stringify(obj, null, 2);
+}
+
+async function sincronizarTempo() {
+  const t0 = Date.now();
+  const res = await fetch('/time');
+  const data = await res.json();
+  const t1 = Date.now();
+  const latenciaEstimada = (t1 - t0) / 2;
+  offsetMs = data.epoch_ms + latenciaEstimada - t1;
+  document.getElementById('offset').textContent = `${Math.round(offsetMs)} ms`;
+  mostrar({ algoritmo: 'Cristian simplificado', t0, t1, latenciaEstimada, ...data });
+}
+
+async function criarAgendamento() {
+  if (!offsetMs) await sincronizarTempo();
+  const payload = {
+    cientista_id: Number(document.getElementById('cientista_id').value),
+    telescopio_id: Number(document.getElementById('telescopio_id').value),
+    horario_inicio_utc: document.getElementById('inicio').value,
+    horario_fim_utc: document.getElementById('fim').value,
+    timestamp_requisicao_utc: horaLogicaISO(),
+    objetivo_observacao: document.getElementById('objetivo').value,
+  };
+  const res = await fetch('/agendamentos', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (res.status === 201) ultimoAgendamento = data;
+  mostrar({ status_http: res.status, body: data });
+}
+
+async function cancelarViaHateoas() {
+  if (!ultimoAgendamento || !ultimoAgendamento._links || !ultimoAgendamento._links.cancelar) {
+    mostrar({ erro: 'Nenhum agendamento confirmado com link HATEOAS de cancelamento disponível.' });
+    return;
+  }
+  const link = ultimoAgendamento._links.cancelar;
+  const res = await fetch(link.href, {
+    method: link.method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ motivo: 'Cancelamento realizado pela interface web usando HATEOAS.' }),
+  });
+  const data = await res.json();
+  ultimoAgendamento = data;
+  mostrar({ status_http: res.status, link_usado: link, body: data });
+}
+
+async function listarAgendamentos() {
+  const res = await fetch('/agendamentos');
+  mostrar(await res.json());
+}
+</script>
+</body>
+</html>

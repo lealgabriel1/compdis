@@ -1,0 +1,18 @@
+services:
+  servico-coordenador:
+    build: ./servico-coordenador
+    container_name: sctec-coordenador
+    ports:
+      - "3000:3000"
+
+  servico-agendamento:
+    build: ./servico-agendamento
+    container_name: sctec-agendamento
+    ports:
+      - "5000:5000"
+    environment:
+      USE_COORDINATOR: "true"
+      COORDINATOR_URL: "http://servico-coordenador:3000"
+      RACE_DELAY_SECONDS: "0.35"
+    depends_on:
+      - servico-coordenador
