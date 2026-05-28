@@ -1,5 +1,7 @@
 node_modules/
 .venv/
+venv
 PROJETO.pdf
 __pycache__/
 *.log
+*.db
